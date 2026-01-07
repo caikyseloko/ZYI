@@ -1,137 +1,113 @@
 #!/usr/bin/env python3
 """
-Script de treino preparado para Colab:
-- Use com GPU (Runtime -> GPU)
-- Ajuste paths para o diretório onde guardou data/coco128
-- Salva checkpoints no checkpoint-dir (pode apontar para /content/drive/MyDrive/...)
+Prepara COCO 2014 em 128x128 e cria annotations_processed.json (map filename -> caption).
+Aceita:
+  --use-blip true|false    : habilita/desabilita geração de captions com BLIP (default: false)
+  --max-images N           : processa no máximo N imagens (default: 2000)
 
-Exemplo:
-python train_colab.py --data-dir data/coco128 --epochs 10 --batch-size 8 --checkpoint-dir /content/drive/MyDrive/zyi_ckpts
+Uso:
+python scripts/prepare_coco.py \
+  --coco-ann /path/captions_train2014.json \
+  --images-dir /path/train2014 \
+  --out-dir data/coco128 \
+  --use-blip false \
+  --max-images 2000
 """
 import os
+import json
 import argparse
-import math
-import torch
-from torch.utils.data import DataLoader
-from zyi.dataset import COCO128Dataset
-from zyi.utils import Vocab
-from zyi.models import SimpleTextEncoder, Composer, FlowPatch, ImplicitPainter
-import torch.nn.functional as F
+from PIL import Image
+from tqdm import tqdm
+from collections import defaultdict
 
-def collate_fn(batch, vocab, max_len=32):
-    imgs, caps = zip(*batch)
-    imgs = torch.stack(imgs, dim=0)
-    toks = torch.stack([vocab.encode(c, max_len=max_len) for c in caps], dim=0)
-    return imgs, toks
+def load_coco_captions(coco_ann_path):
+    with open(coco_ann_path, 'r', encoding='utf-8') as f:
+        ann = json.load(f)
+    images = {im['id']: im for im in ann['images']}
+    caps = defaultdict(list)
+    for c in ann['annotations']:
+        caps[c['image_id']].append(c['caption'])
+    return images, caps
 
-def build_vocab_if_needed(data_dir, sample_size=5000):
-    vocab_path = os.path.join(data_dir, 'vocab.json')
-    if os.path.exists(vocab_path):
-        return Vocab.load(vocab_path)
-    ds_tmp = COCO128Dataset(data_dir, max_items=sample_size)
-    all_caps = [ds_tmp.ann[k] for k in ds_tmp.filenames]
-    v = Vocab()
-    v.build_from_corpus(all_caps, min_freq=2, max_size=10000)
-    v.save(vocab_path)
-    return v
+def save_image_resized(src_path, dst_path, size=(128,128)):
+    with Image.open(src_path) as im:
+        im = im.convert('RGB')
+        im = im.resize(size, Image.BICUBIC)
+        im.save(dst_path, quality=95)
 
-def main(args):
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    os.makedirs(args.checkpoint_dir, exist_ok=True)
+def prepare(coco_ann, images_dir, out_dir, use_blip=False, max_images=2000):
+    from pathlib import Path
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
+    imgs_dir_out = os.path.join(out_dir, 'images')
+    Path(imgs_dir_out).mkdir(exist_ok=True)
+    images, caps = load_coco_captions(coco_ann)
 
-    vocab = build_vocab_if_needed(args.data_dir)
-    dataset = COCO128Dataset(args.data_dir, max_items=args.max_items)
-    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=2,
-                        collate_fn=lambda b: collate_fn(b, vocab, max_len=32))
+    # optionally load BLIP (if requested)
+    use_blip_model = False
+    if use_blip:
+        try:
+            from transformers import BlipProcessor, BlipForConditionalGeneration
+            import torch
+            device = 'cuda' if torch.cuda.is_available() else 'cpu'
+            processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
+            model = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-base").to(device)
+            use_blip_model = True
+            print("BLIP model loaded on", device)
+        except Exception as e:
+            print("BLIP unavailable, continuing without BLIP captions. Error:", e)
+            use_blip_model = False
 
-    text_enc = SimpleTextEncoder(vocab_size=len(vocab.itos), d_model=384).to(device)
-    composer = Composer(d_text=384, latent_ch=48).to(device)
-    # define patching: split image 128x128 into 8x8 patches of 16x16 -> P=64 patches
-    P = (128 // 16) ** 2
-    patch_dim = 48 * 1  # dimension per-patch vector (we will pool)
-    flow = FlowPatch(patch_dim=patch_dim, cond_dim=384, n_layers=6).to(device)
-    painter = ImplicitPainter(cond_dim=384 + patch_dim, img_size=128).to(device)
+    annotations_out = {}
+    skipped = 0
+    processed = 0
+    total_images = len(images)
+    # iterate deterministically by image id order to make limit predictable
+    for img_idx, (img_id, iminfo) in enumerate(tqdm(sorted(images.items()), desc="Processing images")):
+        if processed >= max_images:
+            break
+        filename = iminfo['file_name']
+        src = os.path.join(images_dir, filename)
+        if not os.path.exists(src):
+            skipped += 1
+            continue
+        dst_name = f"{img_id}.jpg"
+        dst = os.path.join(imgs_dir_out, dst_name)
+        try:
+            save_image_resized(src, dst, size=(128,128))
+        except Exception as e:
+            print("Error processing", src, e)
+            skipped += 1
+            continue
+        caption = caps.get(img_id, [""])[0]
+        if use_blip_model:
+            try:
+                from PIL import Image as PILImage
+                img_pil = PILImage.open(dst).convert('RGB')
+                inputs = processor(images=img_pil, return_tensors="pt").to(device)
+                out = model.generate(**inputs, max_length=40)
+                blip_caption = processor.decode(out[0], skip_special_tokens=True)
+                caption = blip_caption
+            except Exception as e:
+                print("BLIP captioning failed for", dst_name, ":", e)
+        annotations_out[dst_name] = caption
+        processed += 1
 
-    optim = torch.optim.Adam(list(text_enc.parameters()) + list(composer.parameters()) + list(flow.parameters()) + list(painter.parameters()), lr=args.lr)
-
-    for epoch in range(args.epochs):
-        running_loss = 0.0
-        for i, (imgs, toks) in enumerate(loader):
-            imgs = imgs.to(device)
-            toks = toks.to(device)
-            B = imgs.size(0)
-            text_emb = text_enc(toks)  # (B, D)
-            z_comp = torch.randn(B, 64, device=device)
-            latents = composer(text_emb, z_comp)
-            top = latents[-1]  # (B,C,128,128)
-
-            # build patch vectors: adaptive pool to (B, Patches, patch_dim)
-            # here choose pooling to 16x16 patches -> pool to 8x8 then flatten per patch
-            # Simpler approach: downsample top to (B, C, 8,8) then each spatial location is a patch vector
-            patch_map = F.adaptive_avg_pool2d(top, (8,8))  # (B, C, 8,8)
-            B, C, H, W = patch_map.shape
-            patches = patch_map.view(B, C, H*W).permute(0,2,1)  # (B, P, C)
-            # if needed pad/truncate to patch_dim
-            if patches.size(2) > patch_dim:
-                patches = patches[:, :, :patch_dim]
-            elif patches.size(2) < patch_dim:
-                pad = torch.zeros(B, patches.size(1), patch_dim - patches.size(2), device=patches.device)
-                patches = torch.cat([patches, pad], dim=2)
-
-            # flow forward: patches (x) -> z with logdet
-            z, logdet = flow.forward(patches, text_emb)
-            # negative loglikelihood under standard normal: 0.5 * ||z||^2 - logdet
-            nll = 0.5 * (z ** 2).sum(dim=(1,2)) - logdet  # sum over patch dims and patches
-            nll = nll.mean()
-
-            # build painter conditioning vector per image: concat text_emb + global pool of top + pooled patch mean
-            global_pool = top.view(B, C, -1).mean(dim=2)
-            patch_mean = patches.view(B, -1).mean(dim=1, keepdim=True)  # (B,1) not ideal but simple
-            # create final cond per image by concatenation (match ImplicitPainter cond_dim)
-            # ImplicitPainter expects cond_dim = 384 + patch_dim in our setup; create cond by merging text_emb + flattened small vector
-            # For simplicity we use text_emb + mean of patches repeated/padded to match patch_dim
-            patch_summary = patches.view(B, -1)[:, :patch_dim]  # (B, patch_dim)
-            cond = torch.cat([text_emb, patch_summary.mean(dim=1, keepdim=True).expand(-1, patch_dim)], dim=1)
-            # cond currently shape (B, 384+patch_dim) because concatenation above sets that (works with earlier comment)
-
-            # generate image
-            gen = painter(cond)
-
-            # losses
-            pixel_loss = F.mse_loss(gen, imgs)
-            loss = args.lambda_flow * nll + args.lambda_pixel * pixel_loss
-
-            optim.zero_grad()
-            loss.backward()
-            optim.step()
-
-            running_loss += loss.item()
-            if (i+1) % args.log_interval == 0:
-                avg = running_loss / args.log_interval
-                print(f"Epoch {epoch} iter {i+1}/{len(loader)} loss {avg:.4f}")
-                running_loss = 0.0
-
-        # checkpoint
-        ckpt = {
-            'text_enc': text_enc.state_dict(),
-            'composer': composer.state_dict(),
-            'flow': flow.state_dict(),
-            'painter': painter.state_dict(),
-            'vocab': len(vocab.itos)
-        }
-        torch.save(ckpt, os.path.join(args.checkpoint_dir, f'epoch_{epoch}.pth'))
-        print("Saved checkpoint epoch", epoch)
+    ann_out_path = os.path.join(out_dir, 'annotations_processed.json')
+    with open(ann_out_path, 'w', encoding='utf-8') as f:
+        json.dump(annotations_out, f, ensure_ascii=False, indent=2)
+    print(f"Done. Processed: {processed}. Skipped (missing/corrupt): {skipped}. Total in COCO file: {total_images}")
+    print("Images in:", imgs_dir_out)
+    print("Annotations saved to:", ann_out_path)
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    p.add_argument('--data-dir', required=True)
-    p.add_argument('--epochs', type=int, default=10)
-    p.add_argument('--batch-size', type=int, default=8)
-    p.add_argument('--lr', type=float, default=1e-4)
-    p.add_argument('--checkpoint-dir', default='checkpoints')
-    p.add_argument('--max-items', type=int, default=20000)
-    p.add_argument('--log-interval', type=int, default=50)
-    p.add_argument('--lambda-flow', type=float, default=1.0)
-    p.add_argument('--lambda-pixel', type=float, default=1.0)
+    p.add_argument('--coco-ann', required=True, help='coco captions JSON (captions_train2014.json)')
+    p.add_argument('--images-dir', required=True, help='path to train2014 or val2014 images')
+    p.add_argument('--out-dir', required=True)
+    p.add_argument('--use-blip', type=str, default='false', choices=['true','false'],
+                   help='true or false to enable BLIP caption regeneration (default: false)')
+    p.add_argument('--max-images', type=int, default=2000,
+                   help='maximum number of images to process (default: 2000)')
     args = p.parse_args()
-    main(args)
+    use_blip_flag = args.use_blip.lower() == 'true'
+    prepare(args.coco_ann, args.images_dir, args.out_dir, use_blip=use_blip_flag, max_images=args.max_images)
