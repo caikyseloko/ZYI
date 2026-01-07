@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """
 Prepara COCO 2014 em 128x128 e cria annotations_processed.json (map filename -> caption).
-Aceita:
-  --use-blip true|false    : habilita/desabilita geração de captions com BLIP (default: false)
-  --max-images N           : processa no máximo N imagens (default: 2000)
+Funcionalidades:
+ - --use-blip true|false : habilita/desabilita BLIP (default: false)
+ - --max-images N       : processa no máximo N imagens (default: 2000)
+ - resume automático: pula imagens já processadas (se annotations_processed.json existir)
+ - processamento determinístico (ordem por image id)
 
 Uso:
 python scripts/prepare_coco.py \
@@ -42,6 +44,19 @@ def prepare(coco_ann, images_dir, out_dir, use_blip=False, max_images=2000):
     Path(imgs_dir_out).mkdir(exist_ok=True)
     images, caps = load_coco_captions(coco_ann)
 
+    # try to resume if annotations file exists
+    ann_out_path = os.path.join(out_dir, 'annotations_processed.json')
+    if os.path.exists(ann_out_path):
+        try:
+            with open(ann_out_path, 'r', encoding='utf-8') as f:
+                annotations_out = json.load(f)
+            print(f"Resuming: loaded {len(annotations_out)} existing annotations from {ann_out_path}")
+        except Exception as e:
+            print("Could not read existing annotations file; starting fresh. Error:", e)
+            annotations_out = {}
+    else:
+        annotations_out = {}
+
     # optionally load BLIP (if requested)
     use_blip_model = False
     if use_blip:
@@ -57,44 +72,62 @@ def prepare(coco_ann, images_dir, out_dir, use_blip=False, max_images=2000):
             print("BLIP unavailable, continuing without BLIP captions. Error:", e)
             use_blip_model = False
 
-    annotations_out = {}
     skipped = 0
-    processed = 0
+    processed = len(annotations_out)
     total_images = len(images)
+    print(f"COCO images meta: {total_images} entries. Will process up to max_images={max_images}. Already processed={processed}.")
+
     # iterate deterministically by image id order to make limit predictable
     for img_idx, (img_id, iminfo) in enumerate(tqdm(sorted(images.items()), desc="Processing images")):
         if processed >= max_images:
             break
+        dst_name = f"{img_id}.jpg"
+        # skip if already processed in annotations map AND file exists
+        dst_path = os.path.join(imgs_dir_out, dst_name)
+        if dst_name in annotations_out and os.path.exists(dst_path):
+            # already processed
+            continue
+
         filename = iminfo['file_name']
         src = os.path.join(images_dir, filename)
         if not os.path.exists(src):
             skipped += 1
             continue
-        dst_name = f"{img_id}.jpg"
-        dst = os.path.join(imgs_dir_out, dst_name)
+        # save/resample
         try:
-            save_image_resized(src, dst, size=(128,128))
+            save_image_resized(src, dst_path, size=(128,128))
         except Exception as e:
             print("Error processing", src, e)
             skipped += 1
             continue
+
+        # caption: COCO default (first) or BLIP-generated
         caption = caps.get(img_id, [""])[0]
         if use_blip_model:
             try:
                 from PIL import Image as PILImage
-                img_pil = PILImage.open(dst).convert('RGB')
+                img_pil = PILImage.open(dst_path).convert('RGB')
                 inputs = processor(images=img_pil, return_tensors="pt").to(device)
                 out = model.generate(**inputs, max_length=40)
                 blip_caption = processor.decode(out[0], skip_special_tokens=True)
                 caption = blip_caption
             except Exception as e:
+                # do not fail the loop; fallback to COCO caption
                 print("BLIP captioning failed for", dst_name, ":", e)
+
         annotations_out[dst_name] = caption
         processed += 1
 
-    ann_out_path = os.path.join(out_dir, 'annotations_processed.json')
+        # periodically flush to disk
+        if processed % 50 == 0:
+            with open(ann_out_path, 'w', encoding='utf-8') as f:
+                json.dump(annotations_out, f, ensure_ascii=False, indent=2)
+            print(f"Flushed {processed} annotations to {ann_out_path}")
+
+    # final save
     with open(ann_out_path, 'w', encoding='utf-8') as f:
         json.dump(annotations_out, f, ensure_ascii=False, indent=2)
+
     print(f"Done. Processed: {processed}. Skipped (missing/corrupt): {skipped}. Total in COCO file: {total_images}")
     print("Images in:", imgs_dir_out)
     print("Annotations saved to:", ann_out_path)
@@ -106,6 +139,11 @@ if __name__ == "__main__":
     p.add_argument('--out-dir', required=True)
     p.add_argument('--use-blip', type=str, default='false', choices=['true','false'],
                    help='true or false to enable BLIP caption regeneration (default: false)')
+    p.add_argument('--max-images', type=int, default=2000,
+                   help='maximum number of images to process (default: 2000)')
+    args = p.parse_args()
+    use_blip_flag = args.use_blip.lower() == 'true'
+    prepare(args.coco_ann, args.images_dir, args.out_dir, use_blip=use_blip_flag, max_images=args.max_images)
     p.add_argument('--max-images', type=int, default=2000,
                    help='maximum number of images to process (default: 2000)')
     args = p.parse_args()
