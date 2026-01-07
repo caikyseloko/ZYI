@@ -1,0 +1,12 @@
+torch>=1.12
+torchvision
+transformers>=4.20
+tqdm
+Pillow
+numpy
+pycocotools
+ftfy
+regex
+sentencepiece
+scikit-image
+scipy
